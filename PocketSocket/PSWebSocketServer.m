@@ -13,7 +13,7 @@
 //  limitations under the License.
 
 #import "PSWebSocketServer.h"
-#import "PSwebSocket.h"
+#import "PSWebSocket.h"
 #import "PSWebSocketDriver.h"
 #import "PSWebSocketInternal.h"
 #import "PSWebSocketBuffer.h"
@@ -26,6 +26,7 @@
 #import <netdb.h>
 #import <arpa/inet.h>
 #import <Security/SecureTransport.h>
+#include <netinet/tcp.h>    // for TCP_NODELAY
 
 typedef NS_ENUM(NSInteger, PSWebSocketServerConnectionReadyState) {
     PSWebSocketServerConnectionReadyStateConnecting = 0,
@@ -81,6 +82,8 @@ void PSWebSocketServerAcceptCallback(CFSocketRef s, CFSocketCallBackType type, C
     NSMapTable *_connectionsByStreams;
     
     NSMutableSet *_webSockets;
+    
+    BOOL _tcpNoDelay;
 }
 @end
 @implementation PSWebSocketServer
@@ -190,6 +193,9 @@ void PSWebSocketServerAcceptCallback(CFSocketRef s, CFSocketCallBackType type, C
     [self executeWork:^{
         [self disconnectGracefully:NO];
     }];
+}
+- (void)setTcpNoDelay:(BOOL)on {
+    _tcpNoDelay = on;
 }
 
 #pragma mark - Connection
@@ -529,6 +535,10 @@ void PSWebSocketServerAcceptCallback(CFSocketRef s, CFSocketCallBackType type, C
             // create webSocket
             PSWebSocket *webSocket = [PSWebSocket serverSocketWithRequest:request inputStream:connection.inputStream outputStream:connection.outputStream];
             
+            if (_tcpNoDelay) {
+                [self disableNaglesAlgorithmForStream:connection.outputStream];
+            }
+            
             // attach webSocket
             [self attachWebSocket:webSocket];
             
@@ -541,6 +551,40 @@ void PSWebSocketServerAcceptCallback(CFSocketRef s, CFSocketCallBackType type, C
         }
     }
 }
+
+- (void)disableNaglesAlgorithmForStream:(NSStream *)stream {
+    
+    CFDataRef socketData;
+    
+    // Get socket data
+    if ([stream isKindOfClass:[NSOutputStream class]]) {
+        socketData = CFWriteStreamCopyProperty((__bridge CFWriteStreamRef)((NSOutputStream *)stream), kCFStreamPropertySocketNativeHandle);
+    } else if ([stream isKindOfClass:[NSInputStream class]]) {
+        socketData = CFReadStreamCopyProperty((__bridge CFReadStreamRef)((NSInputStream *)stream), kCFStreamPropertySocketNativeHandle);
+    }
+    
+    // get a handle to the native socket
+    CFSocketNativeHandle rawsock;
+    
+    CFDataGetBytes(socketData, CFRangeMake(0, sizeof(CFSocketNativeHandle)), (UInt8 *)&rawsock);
+    CFRelease(socketData);
+    
+    // Debug info
+    BOOL isInput = [stream isKindOfClass:[NSInputStream class]];
+    NSString * streamType = isInput ? @"INPUT" : @"OUTPUT";
+    
+    // Disable Nagle's algorythm
+    int err;
+    static const int kOne = 1;
+    err = setsockopt(rawsock, IPPROTO_TCP, TCP_NODELAY, &kOne, sizeof(kOne));
+    if (err < 0) {
+        err = errno;
+        NSLog(@"Could Not Disable Nagle for %@ stream", streamType);
+    } else {
+        NSLog(@"Nagle Is Disabled for %@ stream", streamType);
+    }
+}
+
 - (void)pumpOutput {
     for(PSWebSocketServerConnection *connection in _connections.allObjects) {
         if(connection.readyState != PSWebSocketServerConnectionReadyStateOpen &&
